@@ -332,7 +332,8 @@ class System (MSONable) :
             # this system is non-converged but the system to append is converged
             self.data = system.data
             return False
-        assert(system.formula == self.formula)
+        if system.uniq_formula != self.uniq_formula:
+            raise RuntimeError('systems with inconsistent formula could not be append: %s v.s. %s' % (self.uniq_formula, system.uniq_formula))
         if system.data['atom_names'] != self.data['atom_names']:
             # allow to append a system with different atom_names order
             system.sort_atom_names()
@@ -369,7 +370,8 @@ class System (MSONable) :
             # atom_names must be a subset of type_map
             assert (set(self.data['atom_names']).issubset(set(type_map)))
             # for the condition that type_map is a proper superset of atom_names
-            new_atoms = set(type_map) - set(self.data["atom_names"])
+            # new_atoms = set(type_map) - set(self.data["atom_names"])
+            new_atoms = [e for e in type_map if e not in self.data["atom_names"]]
             if new_atoms:
                 self.add_atom_names(new_atoms)
             # index that will sort an array by type_map
@@ -417,6 +419,16 @@ class System (MSONable) :
         """
         return ''.join(["{}{}".format(symbol,numb) for symbol,numb in 
             zip(self.data['atom_names'], self.data['atom_numbs'])])
+
+    @property
+    def uniq_formula(self):
+        """
+        Return the uniq_formula of this system. 
+        The uniq_formula sort the elements in formula by names.
+        Systems with the same uniq_formula can be append together.
+        """
+        return ''.join(["{}{}".format(symbol,numb) for symbol,numb in sorted(
+            zip(self.data['atom_names'], self.data['atom_numbs']))])
 
 
     def extend(self, systems):
@@ -497,6 +509,7 @@ class System (MSONable) :
             structure=Structure(system.data['cells'][0],species,system.data['coords'][0],coords_are_cartesian=True)
             structures.append(structure)
         return structures
+    
 
     @register_to_funcs.register_funcs("ase/structure")
     def to_ase_structure(self):
@@ -511,9 +524,7 @@ class System (MSONable) :
            raise ImportError('No module ase.Atoms')
 
         for system in self.to_list():
-            species=[]
-            for name,numb in zip(system.data['atom_names'],system.data['atom_numbs']):
-                species.extend([name]*numb)
+            species=[system.data['atom_names'][tt] for tt in system.data['atom_types']]
             structure=Atoms(symbols=species,positions=system.data['coords'][0],pbc=True,cell=system.data['cells'][0])
             structures.append(structure)
         return structures
@@ -1041,8 +1052,8 @@ class LabeledSystem (System):
 
     @register_from_funcs.register_funcs('cp2k/aimd_output')
     def from_cp2k_aimd_output(self, file_dir):
-        xyz_file=glob.glob("{}/*pos*.xyz".format(file_dir))[0]
-        log_file=glob.glob("{}/*.log".format(file_dir))[0]
+        xyz_file=sorted(glob.glob("{}/*pos*.xyz".format(file_dir)))[0]
+        log_file=sorted(glob.glob("{}/*.log".format(file_dir)))[0]
         for info_dict in Cp2kSystems(log_file, xyz_file):
             l = LabeledSystem(data=info_dict)
             self.append(l)
@@ -1333,6 +1344,26 @@ class LabeledSystem (System):
                 self.data[ii] = self.data[ii][idx]
         return idx
 
+    def to_pymatgen_ComputedStructureEntry(self):
+        '''
+        convert System to Pymagen ComputedStructureEntry obj
+
+        '''
+        try:
+           from pymatgen.entries.computed_entries import ComputedStructureEntry
+        except:
+           raise ImportError('No module ComputedStructureEntry in pymatgen.entries.computed_entries')
+
+        entries=[]
+        for system in self.to_list():
+            structure=system.to_pymatgen_structure()[0]
+            energy=system.data['energies'][0]
+            data={'forces':system.data['forces'][0],
+                  'virials':system.data['virials'][0]}
+
+            entry=ComputedStructureEntry(structure,energy,data=data)
+            entries.append(entry)
+        return entries
 
 class MultiSystems:
     '''A set containing several systems.'''
@@ -1384,11 +1415,11 @@ class MultiSystems:
         return multi_systems
 
     @classmethod
-    def from_dir(cls,dir_name, file_name, fmt='auto'):
+    def from_dir(cls,dir_name, file_name, fmt='auto', type_map=None):
         multi_systems = cls()
-        target_file_list = glob.glob('./{}/**/{}'.format(dir_name, file_name), recursive=True)
+        target_file_list = sorted(glob.glob('./{}/**/{}'.format(dir_name, file_name), recursive=True))
         for target_file in target_file_list:
-            multi_systems.append(LabeledSystem(file_name=target_file, fmt=fmt))
+            multi_systems.append(LabeledSystem(file_name=target_file, fmt=fmt, type_map=type_map))
         return multi_systems
 
 
@@ -1438,8 +1469,10 @@ class MultiSystems:
         """
         Make atom_names in all systems equal, prevent inconsistent atom_types.
         """
-        new_in_system = set(system["atom_names"]) - set(self.atom_names)
-        new_in_self = set(self.atom_names) - set(system["atom_names"])
+        # new_in_system = set(system["atom_names"]) - set(self.atom_names)
+        # new_in_self = set(self.atom_names) - set(system["atom_names"])
+        new_in_system = [e for e in system["atom_names"] if e not in self.atom_names]
+        new_in_self = [e for e in self.atom_names if e not in system["atom_names"]]
         if len(new_in_system):
             # A new atom_name appear, add to self.atom_names
             self.atom_names.extend(new_in_system)
@@ -1460,6 +1493,7 @@ class MultiSystems:
         # print(next(quip_gap_xyz_systems))
         for info_dict in QuipGapxyzSystems(file_name):
             system=LabeledSystem(data=info_dict)
+            system.sort_atom_names()
             self.append(system)
 
 
@@ -1487,6 +1521,26 @@ class MultiSystems:
             system.to_deepmd_npy(os.path.join(folder, system_name),
                                  set_size = set_size,
                                  prec = prec)
+
+    def from_deepmd_raw(self, folder):
+        for dd in os.listdir(folder):
+            self.append(LabeledSystem(os.path.join(folder, dd), fmt='deepmd/raw'))
+        return self
+
+    def from_deepmd_npy(self, folder):
+        for dd in os.listdir(folder):
+            self.append(LabeledSystem(os.path.join(folder, dd), fmt='deepmd/npy'))
+        return self
+
+    def predict(self, dp):
+        import deepmd.DeepPot as DeepPot
+        if not isinstance(dp, DeepPot):
+            dp = DeepPot(dp)
+        new_multisystems = dpdata.MultiSystems()
+        for ss in self:
+            new_multisystems.append(ss.predict(dp))
+        return new_multisystems
+
 
 def check_System(data):
     keys={'atom_names','atom_numbs','cells','coords','orig','atom_types'}
